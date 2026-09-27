@@ -232,6 +232,11 @@ fn send_eye_data(socket: &UdpSocket, args: &Args, data: EyeData) -> Result<(), B
             vec![OscType::Float(value)],
         )?;
     }
+    // Native eye look
+    let closed_amount = 1.0 - (data.openness[0].clamp(0.0, 1.0) + data.openness[1].clamp(0.0, 1.0)) / 2.0;
+    send(socket, format!("/tracking/eye/EyesClosedAmount"), vec![OscType::Float(closed_amount)],)?;
+    let degree_multiplier = 180.0 / 4.0;
+    send(socket, format!("/tracking/eye/LeftRightPitchYaw"), vec![OscType::Float(-left_y * degree_multiplier), OscType::Float(left_x * degree_multiplier), OscType::Float(-right_y * degree_multiplier), OscType::Float(right_x * degree_multiplier),],)?;
     Ok(())
 }
 
