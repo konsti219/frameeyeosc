@@ -72,6 +72,9 @@ struct Args {
     target: String,
     #[arg(long, default_value = "/FT")]
     prefix: String,
+    /// Send the raw eye openness values instead of the hand tuned remap.
+    #[arg(long)]
+    raw_lids: bool,
 }
 
 struct EyeSource {
@@ -91,6 +94,23 @@ struct EyeData {
     gaze: [[f32; 3]; 2],
     fixation_point: [f32; 3],
     openness: [f32; 2],
+}
+
+// Valves eyelid output is kinda bad and asymmetric, so do a shitty hand tuned remap per eye
+const OPENNESS_CLOSED: [f32; 2] = [0.26, 0.29];
+const OPENNESS_OPEN: [f32; 2] = [0.70, 0.75];
+const OPENNESS_WIDE: [f32; 2] = [0.88, 0.83];
+const LID_NEUTRAL: f32 = 0.75;
+const LID_SMOOTHING: f32 = 0.4;
+
+fn remap_lid(eye: usize, value: f32) -> f32 {
+    let (closed, open, wide) = (OPENNESS_CLOSED[eye], OPENNESS_OPEN[eye], OPENNESS_WIDE[eye]);
+    let lid = if value < open {
+        (value - closed) / (open - closed) * LID_NEUTRAL
+    } else {
+        LID_NEUTRAL + (value - open) / (wide - open) * (1.0 - LID_NEUTRAL)
+    };
+    lid.clamp(0.0, 1.0)
 }
 
 impl EyeSource {
@@ -221,8 +241,8 @@ fn send_eye_data(socket: &UdpSocket, args: &Args, data: EyeData) -> Result<(), B
         ("EyeLeftY", left_y),
         ("EyeRightX", right_x),
         ("EyeRightY", right_y),
-        ("EyeLidLeft", data.openness[0].clamp(0.0, 1.0)),
-        ("EyeLidRight", data.openness[1].clamp(0.0, 1.0)),
+        ("EyeLidLeft", data.openness[0]),
+        ("EyeLidRight", data.openness[1]),
         ("EyeX", x),
         ("EyeY", y),
     ] {
@@ -233,10 +253,24 @@ fn send_eye_data(socket: &UdpSocket, args: &Args, data: EyeData) -> Result<(), B
         )?;
     }
     // Native eye look
-    let closed_amount = 1.0 - (data.openness[0].clamp(0.0, 1.0) + data.openness[1].clamp(0.0, 1.0)) / 2.0;
-    send(socket, format!("/tracking/eye/EyesClosedAmount"), vec![OscType::Float(closed_amount)],)?;
+    let closed_amount =
+        1.0 - ((data.openness[0] + data.openness[1]) / 2.0 / LID_NEUTRAL).clamp(0.0, 1.0);
+    send(
+        socket,
+        format!("/tracking/eye/EyesClosedAmount"),
+        vec![OscType::Float(closed_amount)],
+    )?;
     let degree_multiplier = 180.0 / 4.0;
-    send(socket, format!("/tracking/eye/LeftRightPitchYaw"), vec![OscType::Float(-left_y * degree_multiplier), OscType::Float(left_x * degree_multiplier), OscType::Float(-right_y * degree_multiplier), OscType::Float(right_x * degree_multiplier),],)?;
+    send(
+        socket,
+        format!("/tracking/eye/LeftRightPitchYaw"),
+        vec![
+            OscType::Float(-left_y * degree_multiplier),
+            OscType::Float(left_x * degree_multiplier),
+            OscType::Float(-right_y * degree_multiplier),
+            OscType::Float(right_x * degree_multiplier),
+        ],
+    )?;
     Ok(())
 }
 
@@ -270,6 +304,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut source = EyeSource::open()?;
     eprintln!("Reading {SOURCE} and sending OSC to {target}");
     let mut active = false;
+    let mut lids = [LID_NEUTRAL; 2];
     loop {
         match source.next(TIMEOUT)? {
             Some(data)
@@ -278,7 +313,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                     && data.fixation_point.iter().all(|value| value.is_finite())
                     && data.openness.iter().all(|value| value.is_finite()) =>
             {
-                send_eye_data(&socket, &args, data)?;
+                for eye in 0..2 {
+                    let lid = if args.raw_lids {
+                        data.openness[eye].clamp(0.0, 1.0)
+                    } else {
+                        remap_lid(eye, data.openness[eye])
+                    };
+                    lids[eye] += (lid - lids[eye]) * LID_SMOOTHING;
+                }
+                send_eye_data(
+                    &socket,
+                    &args,
+                    EyeData {
+                        openness: lids,
+                        ..data
+                    },
+                )?;
                 active = true;
             }
             _ if active => {
