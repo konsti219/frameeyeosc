@@ -1,4 +1,4 @@
-//! Steam Frame 0.5.0 eye bridge using the private version-4 shared-memory ABI.
+//! Steam Frame eye bridge using the private eye-server shared-memory ABI (versions 4 and 5).
 
 use clap::Parser;
 use memmap2::{MmapMut, MmapOptions};
@@ -11,21 +11,25 @@ use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::ptr;
 use std::time::Duration;
 
-const SHM_VERSION: u32 = 4;
-const SHM_SIZE: usize = 0x4f21a;
 const SOURCE: &str = "/dev/shm/eye-server.mmap";
 const TIMEOUT: Duration = Duration::from_secs(1);
 
+fn abi(version: u32) -> Option<(usize, usize)> {
+    match version {
+        4 => Some((0x4f21a, 0x152)), // 0.5.0, build 20260921
+        5 => Some((0x4f21f, 0x157)), // build 20260930
+        _ => None,
+    }
+}
+
 #[repr(C)]
-struct EyeServerMmap {
+struct EyeServerHeader {
     version: u32,
     initialized: u32,
     // The target glibc mutex slot is 48 bytes; host libc may define a smaller type.
     metadata_mutex: [u8; 0x30],
     sequence: u32,
     metadata_requested: u32,
-    other_control_fields: [u8; 0x112],
-    eye_data: EyeDataMmap,
 }
 
 // The record is packed, so its timestamp and vectors are not naturally aligned.
@@ -48,10 +52,9 @@ struct EyeDataMmap {
 }
 
 const _: () = {
-    assert!(offset_of!(EyeServerMmap, metadata_mutex) == 0x08);
-    assert!(offset_of!(EyeServerMmap, sequence) == 0x38);
-    assert!(offset_of!(EyeServerMmap, metadata_requested) == 0x3c);
-    assert!(offset_of!(EyeServerMmap, eye_data) == 0x152);
+    assert!(offset_of!(EyeServerHeader, metadata_mutex) == 0x08);
+    assert!(offset_of!(EyeServerHeader, sequence) == 0x38);
+    assert!(offset_of!(EyeServerHeader, metadata_requested) == 0x3c);
     assert!(offset_of!(EyeDataMmap, sample_time) == 0x05);
     assert!(offset_of!(EyeDataMmap, gaze_direction) == 0x0d);
     assert!(offset_of!(EyeDataMmap, gaze_covariance_diag) == 0x25);
@@ -60,7 +63,6 @@ const _: () = {
     assert!(offset_of!(EyeDataMmap, pre_fusion_cov_diag) == 0x61);
     assert!(offset_of!(EyeDataMmap, openness) == 0x79);
     assert!(size_of::<EyeDataMmap>() == 0xebc);
-    assert!(size_of::<EyeServerMmap>() <= SHM_SIZE);
     assert!(size_of::<libc::pthread_mutex_t>() <= 0x30);
     assert!(8 % align_of::<libc::pthread_mutex_t>() == 0);
 };
@@ -79,6 +81,7 @@ struct Args {
 
 struct EyeSource {
     map: MmapMut,
+    record_offset: usize,
 }
 
 struct MutexGuard(*mut libc::pthread_mutex_t);
@@ -116,30 +119,31 @@ fn remap_lid(eye: usize, value: f32) -> f32 {
 impl EyeSource {
     fn open() -> Result<Self, Box<dyn Error>> {
         let file = OpenOptions::new().read(true).write(true).open(SOURCE)?;
-        if file.metadata()?.len() < SHM_SIZE as u64 {
+        let len = file.metadata()?.len() as usize;
+        if len < size_of::<EyeServerHeader>() {
             return Err(format!("{SOURCE}: shared memory is too small").into());
         }
-        let map = unsafe { MmapOptions::new().len(SHM_SIZE).map_mut(&file)? };
-        let source = Self { map };
-        let layout = source.layout();
-        let version = u32::from_le(unsafe { ptr::read_volatile(&raw const (*layout).version) });
-        if version != SHM_VERSION {
-            return Err(format!(
-                "unsupported eye shared-memory version {version}; expected {SHM_VERSION} (Frame 0.5.0)"
-            )
-            .into());
+        let map = unsafe { MmapOptions::new().len(len).map_mut(&file)? };
+        let header: *const EyeServerHeader = map.as_ptr().cast();
+        let version = u32::from_le(unsafe { ptr::read_volatile(&raw const (*header).version) });
+        let (size, record_offset) = abi(version).ok_or_else(|| {
+            format!("Unsupported eye shared-memory version {version}. Only  4 and 5 are supported")
+        })?;
+        if len < size {
+            return Err(format!("{SOURCE}: {len} bytes, version {version} needs {size}").into());
         }
-        if u32::from_le(unsafe { ptr::read_volatile(&raw const (*layout).initialized) }) != 1 {
-            return Err("eye shared memory is not initialized".into());
+        if u32::from_le(unsafe { ptr::read_volatile(&raw const (*header).initialized) }) != 1 {
+            return Err("Eye shared memory is not initialized".into());
         }
-        Ok(source)
+        eprintln!("Eye shared memory version {version}");
+        Ok(Self { map, record_offset })
     }
 
-    fn layout(&self) -> *const EyeServerMmap {
+    fn layout(&self) -> *const EyeServerHeader {
         self.map.as_ptr().cast()
     }
 
-    fn layout_mut(&mut self) -> *mut EyeServerMmap {
+    fn layout_mut(&mut self) -> *mut EyeServerHeader {
         self.map.as_mut_ptr().cast()
     }
 
@@ -191,8 +195,8 @@ impl EyeSource {
 
         let guard = self.lock()?;
         let data = if unsafe { ptr::read_volatile(sequence_ptr) } != sequence {
-            let record_ptr = unsafe { &raw const (*self.layout()).eye_data };
-            let record = unsafe { ptr::read_unaligned(record_ptr) };
+            let record_ptr = unsafe { self.map.as_ptr().add(self.record_offset) };
+            let record = unsafe { ptr::read_unaligned(record_ptr.cast::<EyeDataMmap>()) };
             if record.producer_state == 1 {
                 Some(EyeData {
                     sample_time: record.sample_time,
