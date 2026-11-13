@@ -3,7 +3,9 @@
 Reading Steam Frame eye-tracking data (gaze and eye openness) and sending it via OSC.
 
 > [!WARNING]
-> This is an experimental Proof of Concept and not intended for the average user. If you want proper eye-tracking wait for Babble to release their dedicated Frame software.
+> This project was a proof of concept and has largely been superseded by the [Babble Frame Runtime](https://github.com/Project-Babble/Babble-Frame-Runtime), which is also a lot more user-friendly.
+>
+> But if you like tinkering with your Frame, check out [frame-shell](https://github.com/konsti219/frame-shell).
 
 Against what was suspected early on, the Steam Frame does also track eye openness (lid position) in addition to gaze.
 However, this data is only exposed in an internal shared-memory object (`/dev/shm/eye-server.mmap`), and not via any public APIs.
